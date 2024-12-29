@@ -20,8 +20,8 @@ securities = {
     'NIFTYBEES': '10576'
 }
 
-def nsc_market_order(symbol, quantity, buy_price, trigger_price):
-    return dhan.place_order(security_id=securities[symbol], quantity=quantity, price=buy_price, trigger_price=trigger_price,
+def nsc_limit_order(symbol, quantity, buy_price):
+    return dhan.place_order(security_id=securities[symbol], quantity=quantity, price=buy_price,
         exchange_segment=dhan.NSE, transaction_type=dhan.BUY, order_type=dhan.LIMIT, product_type=dhan.CNC)
 
 def last_traded_price(symbol):
@@ -30,4 +30,5 @@ def last_traded_price(symbol):
     except Exception as e:
         return 0
 
-print(last_traded_price('NIFTYBEES'))
+# print(last_traded_price('NIFTYBEES'))
+print(dhan.get_holdings())
