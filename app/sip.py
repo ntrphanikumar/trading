@@ -7,6 +7,7 @@ from google.genai import types
 from dotenv import load_dotenv
 from orders import place_market_order
 from portfolio import get_holdings, get_fund_limits
+from notify import send_telegram
 
 load_dotenv(os.path.join(os.path.dirname(__file__), '.env'))
 
@@ -212,6 +213,7 @@ def run_sip():
         save_carry_forward(carry)
         log.info(f"Market closed/holiday — carried forward Rs.{DAILY_BUDGET}, total carry Rs.{carry}")
         print(f"Market is closed today. Rs.{DAILY_BUDGET} carried forward (total: Rs.{carry})")
+        send_telegram(f"Market closed today. Rs.{DAILY_BUDGET} carried forward (total: Rs.{carry})")
         return
 
     carry = load_carry_forward()
@@ -312,6 +314,19 @@ def run_sip():
     save_carry_forward(0)  # Reset carry after trading day attempt
     log.info(f"SIP complete: {succeeded}/{len(results)} orders placed")
     print(f"\nSIP complete: {succeeded}/{len(results)} orders placed")
+
+    # Notify via Telegram
+    order_lines = "\n".join(
+        f"  {'OK' if (results[i] if i < len(results) else 'SKIP') == 'OK' else 'FAIL'} "
+        f"{o['quantity']}x {o['stock_name']} @ Rs.{snapshot.get(o['stock_name'], {}).get('ltp', 0):.2f}"
+        for i, o in enumerate(orders) if o.get("stock_name") in SIP_ETFS
+    )
+    send_telegram(
+        f"*SIP Executed* ({date.today().isoformat()})\n"
+        f"Budget: Rs.{budget:,.0f}\n"
+        f"Orders ({succeeded}/{len(results)}):\n{order_lines}\n\n"
+        f"_{reasoning}_"
+    )
 
     # Save trade history
     save_trade_history(
