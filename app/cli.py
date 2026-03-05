@@ -1,5 +1,6 @@
 import os
 import json
+from datetime import date
 from google import genai
 from google.genai import types
 from dotenv import load_dotenv
@@ -30,8 +31,36 @@ from orders import (
 from portfolio import get_holdings, get_positions, get_fund_limits
 from stocks import search_stocks
 
+HISTORY_FILE = os.path.join(os.path.dirname(__file__), "sip_history.json")
+
 # Functions that modify state — require confirmation
 CONFIRM_REQUIRED = {"place_market_order", "place_limit_order", "cancel_order"}
+
+
+def get_sip_history(last_n=None):
+    """Get SIP trade history."""
+    if not os.path.exists(HISTORY_FILE):
+        return {"trades": [], "message": "No SIP history yet"}
+    with open(HISTORY_FILE) as f:
+        history = json.load(f)
+    if last_n:
+        history = history[-int(last_n):]
+    return {"trades": history, "total": len(history)}
+
+
+def get_sip_schedule():
+    """Get SIP cron schedule and next execution info."""
+    import subprocess
+    try:
+        result = subprocess.run(["crontab", "-l"], capture_output=True, text=True)
+        if result.returncode != 0:
+            return {"message": "No crontab configured"}
+        sip_lines = [l.strip() for l in result.stdout.splitlines() if "sip.py" in l and not l.startswith("#")]
+        if not sip_lines:
+            return {"message": "No SIP cron job found"}
+        return {"cron_entries": sip_lines, "raw_crontab": result.stdout}
+    except Exception as e:
+        return {"error": str(e)}
 
 
 def web_search(query):
@@ -63,6 +92,8 @@ FUNCTIONS = {
     "get_fund_limits": get_fund_limits,
     "search_stocks": search_stocks,
     "web_search": web_search,
+    "get_sip_history": get_sip_history,
+    "get_sip_schedule": get_sip_schedule,
 }
 
 # Tool declarations — function calling only (Google Search via web_search function)
@@ -155,6 +186,16 @@ tool_declarations = types.Tool(
                 "required": ["query"],
             },
         },
+        {
+            "name": "get_sip_history",
+            "description": "Get the history of automated SIP trades — dates, ETFs bought, quantities, budget, reasoning, and success/failure. Use when user asks about past SIP trades, investment history, or how much was invested.",
+            "parameters": {"type": "object", "properties": {"last_n": {"type": "integer", "description": "Return only the last N trades. Omit to get all."}}},
+        },
+        {
+            "name": "get_sip_schedule",
+            "description": "Get the SIP cron schedule — shows when the next automated SIP will run. Use when user asks about SIP schedule, next run, or cron configuration.",
+            "parameters": {"type": "object", "properties": {}},
+        },
     ],
 )
 
@@ -164,7 +205,8 @@ config = types.GenerateContentConfig(
         thinking_budget=2048,
         include_thoughts=True,
     ),
-    system_instruction="""You are a trading assistant for the Indian stock market (NSE) via the DhanHQ broker.
+    system_instruction=f"""You are a trading assistant for the Indian stock market (NSE) via the DhanHQ broker.
+Today's date is {date.today().isoformat()}.
 You help the user place orders, check their portfolio, and manage trades.
 
 Rules:

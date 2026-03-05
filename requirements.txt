@@ -2,3 +2,4 @@ dhanhq
 requests
 python-dotenv
 google-genai
+flask

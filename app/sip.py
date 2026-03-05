@@ -1,6 +1,7 @@
 import os
 import json
 import logging
+from datetime import date
 from google import genai
 from google.genai import types
 from dotenv import load_dotenv
@@ -22,6 +23,65 @@ DAILY_BUDGET = int(os.getenv("daily_sip_budget", 2000))
 
 # SIP-eligible ETFs
 SIP_ETFS = ["NIFTYBEES", "MID150BEES", "HDFCSML250", "GOLDCASE", "SILVERBEES"]
+
+# Budget carry-forward tracker
+BUDGET_FILE = os.path.join(os.path.dirname(__file__), "sip_budget.json")
+
+# Trade history
+HISTORY_FILE = os.path.join(os.path.dirname(__file__), "sip_history.json")
+
+
+def is_market_open():
+    """Ask LLM with Google Search grounding if NSE is open today."""
+    try:
+        resp = llm_client.models.generate_content(
+            model=MODEL,
+            contents="Is the Indian stock market (NSE) open for trading today? Reply with only YES or NO.",
+            config=types.GenerateContentConfig(
+                tools=[types.Tool(google_search=types.GoogleSearch())],
+            ),
+        )
+        text = ""
+        for part in resp.candidates[0].content.parts:
+            if not getattr(part, "thought", False) and part.text:
+                text += part.text
+        return "YES" in text.upper().strip()
+    except Exception as e:
+        log.warning(f"Could not check market status: {e}")
+    return True  # Default: assume open
+
+
+def load_carry_forward():
+    """Load carry-forward amount from previous holiday accumulations."""
+    if os.path.exists(BUDGET_FILE):
+        with open(BUDGET_FILE) as f:
+            return json.load(f).get("carry_forward", 0)
+    return 0
+
+
+def save_carry_forward(amount):
+    """Save carry-forward budget."""
+    with open(BUDGET_FILE, "w") as f:
+        json.dump({"carry_forward": round(amount, 2)}, f)
+
+
+def save_trade_history(date_str, budget, reasoning, orders, results):
+    """Append today's SIP run to trade history."""
+    history = []
+    if os.path.exists(HISTORY_FILE):
+        with open(HISTORY_FILE) as f:
+            history = json.load(f)
+
+    history.append({
+        "date": date_str,
+        "budget": budget,
+        "reasoning": reasoning,
+        "orders": orders,
+        "results": results,
+    })
+
+    with open(HISTORY_FILE, "w") as f:
+        json.dump(history, f, indent=2)
 
 # Vertex AI setup
 os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = os.path.join(
@@ -109,8 +169,9 @@ You MUST respond with ONLY a valid JSON object in this exact format, nothing els
 
 Rules:
 - Only include ETFs where quantity > 0
-- Quantities must be whole numbers
-- Total cost (quantity * ltp) must not exceed Rs.{budget}
+- Quantities must be whole numbers (you're buying actual units, not fractional)
+- Total cost (quantity * ltp) should be close to Rs.{budget} — you have 10% flexibility (up to Rs.{int(budget * 1.1)}) to fit whole units
+- Maximize budget utilization — don't leave too much unspent
 - You can skip ETFs that are overweight or where market conditions don't favor buying
 - Use the LTP values from the portfolio data for cost calculations"""
 
@@ -144,7 +205,18 @@ Rules:
 
 def run_sip():
     log.info("=" * 40)
-    log.info(f"SIP run started — budget Rs.{DAILY_BUDGET}")
+
+    # Check if market is open
+    if not is_market_open():
+        carry = load_carry_forward() + DAILY_BUDGET
+        save_carry_forward(carry)
+        log.info(f"Market closed/holiday — carried forward Rs.{DAILY_BUDGET}, total carry Rs.{carry}")
+        print(f"Market is closed today. Rs.{DAILY_BUDGET} carried forward (total: Rs.{carry})")
+        return
+
+    carry = load_carry_forward()
+    budget = DAILY_BUDGET + carry
+    log.info(f"SIP run started — daily Rs.{DAILY_BUDGET}, carry Rs.{carry}, effective Rs.{budget}")
 
     # Check funds
     funds = get_fund_limits()
@@ -156,9 +228,9 @@ def run_sip():
     available = float(funds.get("data", {}).get("availabelBalance", 0))
     log.info(f"Available balance: Rs.{available}")
 
-    if available < DAILY_BUDGET:
-        log.warning(f"Insufficient balance Rs.{available} < Rs.{DAILY_BUDGET}, skipping SIP")
-        print(f"Insufficient balance Rs.{available:.0f} (need Rs.{DAILY_BUDGET}), skipping SIP")
+    if available < budget:
+        log.warning(f"Insufficient balance Rs.{available} < Rs.{budget}")
+        print(f"Insufficient balance Rs.{available:.0f} (need Rs.{budget}), skipping SIP")
         return
 
     # Get portfolio snapshot
@@ -169,7 +241,7 @@ def run_sip():
 
     total_value = sum(v["value"] for v in snapshot.values())
     print(f"\nSIP Portfolio: Rs.{total_value:,.0f}")
-    print(f"Budget: Rs.{DAILY_BUDGET}")
+    print(f"Budget: Rs.{DAILY_BUDGET}/day" + (f" + Rs.{carry:.0f} carried forward = Rs.{budget:.0f}" if carry > 0 else ""))
     print(f"\nCurrent holdings:")
     for sym, info in snapshot.items():
         alloc = info["value"] / total_value * 100 if total_value > 0 else 0
@@ -179,7 +251,7 @@ def run_sip():
     # Ask LLM for today's allocation
     print(f"\nAsking Gemini for today's allocation...")
     try:
-        decision = ask_llm_for_allocation(snapshot, DAILY_BUDGET)
+        decision = ask_llm_for_allocation(snapshot, budget)
     except Exception as e:
         log.error(f"LLM error: {e}")
         print(f"ERROR: LLM failed — {e}")
@@ -193,6 +265,7 @@ def run_sip():
 
     if not orders:
         print("No orders recommended today.")
+        save_carry_forward(0)
         return
 
     # Show and validate orders
@@ -207,9 +280,9 @@ def run_sip():
         print(f"  BUY {qty:>4} x {sym:12s} @ Rs.{ltp:>8.2f} = Rs.{cost:>8.0f}  ({o.get('rationale', '')})")
     print(f"  Total: Rs.{total_cost:,.0f}")
 
-    if total_cost > DAILY_BUDGET * 1.1:  # 10% tolerance for rounding
-        print(f"\nWARNING: Total Rs.{total_cost:.0f} exceeds budget Rs.{DAILY_BUDGET}, skipping")
-        log.warning(f"LLM exceeded budget: Rs.{total_cost:.0f} > Rs.{DAILY_BUDGET}")
+    if total_cost > budget * 1.1:  # 10% tolerance for whole unit rounding
+        print(f"\nWARNING: Total Rs.{total_cost:.0f} exceeds budget Rs.{budget:.0f}, skipping")
+        log.warning(f"LLM exceeded budget: Rs.{total_cost:.0f} > Rs.{budget:.0f}")
         return
 
     # Place orders
@@ -236,8 +309,23 @@ def run_sip():
         results.append(status)
 
     succeeded = sum(1 for s in results if s == "OK")
+    save_carry_forward(0)  # Reset carry after trading day attempt
     log.info(f"SIP complete: {succeeded}/{len(results)} orders placed")
     print(f"\nSIP complete: {succeeded}/{len(results)} orders placed")
+
+    # Save trade history
+    save_trade_history(
+        date_str=date.today().isoformat(),
+        budget=budget,
+        reasoning=reasoning,
+        orders=[
+            {"stock_name": o["stock_name"], "quantity": o["quantity"],
+             "ltp": snapshot.get(o["stock_name"], {}).get("ltp", 0),
+             "status": results[i] if i < len(results) else "SKIPPED"}
+            for i, o in enumerate(orders)
+        ],
+        results={"succeeded": succeeded, "total": len(results)},
+    )
 
 
 if __name__ == "__main__":
