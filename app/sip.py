@@ -99,6 +99,28 @@ def save_trade_history(date_str, budget, reasoning, orders, results):
     with open(HISTORY_FILE, "w") as f:
         json.dump(history, f, indent=2)
 
+WEEKLY_BUDGET = DAILY_BUDGET * 5  # 5 trading days
+WEEKLY_OVERSPEND_LIMIT = WEEKLY_BUDGET * 0.20  # 20% weekly flex
+
+
+def get_week_spent():
+    """Total amount spent this week (Mon-Fri) from trade history."""
+    if not os.path.exists(HISTORY_FILE):
+        return 0
+    with open(HISTORY_FILE) as f:
+        history = json.load(f)
+    today = date.today()
+    monday = today - __import__('datetime').timedelta(days=today.weekday())
+    total = 0
+    for entry in history:
+        entry_date = date.fromisoformat(entry["date"])
+        if entry_date >= monday and entry_date <= today:
+            for o in entry.get("orders", []):
+                if o.get("status") == "OK":
+                    total += o.get("quantity", 0) * o.get("ltp", 0)
+    return total
+
+
 SIP_MODEL = "gemini-2.5-flash"
 
 
@@ -127,8 +149,10 @@ def get_portfolio_snapshot():
     return snapshot
 
 
-def ask_llm_for_allocation(snapshot, budget):
+def ask_llm_for_allocation(snapshot, budget, max_spend=None):
     """Ask Gemini to decide today's SIP allocation based on portfolio + market conditions."""
+    if max_spend is None:
+        max_spend = budget
     total_value = sum(v["value"] for v in snapshot.values())
 
     portfolio_summary = json.dumps({
@@ -177,8 +201,8 @@ You MUST respond with ONLY a valid JSON object in this exact format, nothing els
 Rules:
 - Only include ETFs where quantity > 0
 - Quantities must be whole numbers (you're buying actual units, not fractional)
-- HARD BUDGET LIMIT: Total cost (sum of quantity * ltp for all orders) MUST NOT exceed Rs.{budget}. Calculate carefully before responding.
-- Maximize budget utilization — get as close to Rs.{budget} as possible without exceeding it
+- Target budget: Rs.{budget}. You may overspend up to Rs.{int(max_spend)} if there's a strong dip opportunity (20% weekly flex). Calculate carefully.
+- Maximize budget utilization — get as close to Rs.{budget} as possible, overspend only when justified by market dips
 - You can skip ETFs that are overweight or where market conditions don't favor buying
 - Use the LTP values from the portfolio data for cost calculations"""
 
@@ -238,7 +262,12 @@ def run_sip():
 
     carry = load_carry_forward()
     budget = DAILY_BUDGET + carry
-    log.info(f"SIP run started — daily Rs.{DAILY_BUDGET}, carry Rs.{carry}, effective Rs.{budget}")
+    # Weekly overspend flex: allow up to 20% overspend across the week
+    week_spent = get_week_spent()
+    weekly_flex_remaining = max(0, (WEEKLY_BUDGET + WEEKLY_OVERSPEND_LIMIT) - week_spent)
+    max_spend = min(budget * 1.2, weekly_flex_remaining)  # up to 20% over daily budget, capped by weekly flex
+    log.info(f"SIP run started — daily Rs.{DAILY_BUDGET}, carry Rs.{carry}, effective Rs.{budget}, "
+             f"week spent Rs.{week_spent:.0f}, weekly flex remaining Rs.{weekly_flex_remaining:.0f}, max Rs.{max_spend:.0f}")
 
     # Check funds
     funds = get_fund_limits()
@@ -276,7 +305,7 @@ def run_sip():
     # Ask LLM for today's allocation
     print(f"\nAsking Gemini for today's allocation...")
     try:
-        decision = ask_llm_for_allocation(snapshot, budget)
+        decision = ask_llm_for_allocation(snapshot, budget, max_spend)
     except Exception as e:
         log.error(f"LLM error: {e}")
         print(f"ERROR: LLM failed — {e}")
@@ -307,27 +336,25 @@ def run_sip():
         print(f"  BUY {qty:>4} x {sym:12s} @ Rs.{ltp:>8.2f} = Rs.{cost:>8.0f}  ({o.get('rationale', '')})")
     print(f"  Total: Rs.{total_cost:,.0f}")
 
-    if total_cost > budget:
-        log.warning(f"LLM exceeded budget: Rs.{total_cost:.0f} > Rs.{budget:.0f}, trimming orders")
-        print(f"\n  Over budget — trimming to fit Rs.{budget:.0f}...")
-        # Remove orders from the end until we fit
-        while total_cost > budget and orders:
-            dropped = orders.pop()
-            drop_ltp = snapshot.get(dropped["stock_name"], {}).get("ltp", 0)
-            total_cost -= dropped["quantity"] * drop_ltp
-            print(f"  Dropped {dropped['stock_name']} x{dropped['quantity']}")
-        # If still over, reduce quantity of the last remaining order
-        if orders and total_cost > budget:
+    if total_cost > max_spend:
+        log.warning(f"LLM exceeded max spend: Rs.{total_cost:.0f} > Rs.{max_spend:.0f}, trimming from end")
+        print(f"\n  Over max spend — trimming from lowest priority...")
+        # Reduce last order's qty first, drop if needed, then move to next
+        while total_cost > max_spend and orders:
             last = orders[-1]
             last_ltp = snapshot.get(last["stock_name"], {}).get("ltp", 1)
-            excess = total_cost - budget
-            reduce_qty = int(excess / last_ltp) + 1
-            last["quantity"] = max(0, last["quantity"] - reduce_qty)
-            total_cost = sum(o["quantity"] * snapshot.get(o["stock_name"], {}).get("ltp", 0) for o in orders)
-        orders = [o for o in orders if o.get("quantity", 0) > 0]
+            excess = total_cost - max_spend
+            reduce_by = min(last["quantity"], int(excess / last_ltp) + 1)
+            last["quantity"] -= reduce_by
+            total_cost -= reduce_by * last_ltp
+            if last["quantity"] <= 0:
+                print(f"  Dropped {last['stock_name']}")
+                orders.pop()
+            else:
+                print(f"  Reduced {last['stock_name']} by {reduce_by} to {last['quantity']}")
         if not orders:
             print("  No orders remain after trimming.")
-            send_telegram(f"SIP FAILED: All orders exceeded budget Rs.{budget:.0f} after trimming")
+            send_telegram(f"SIP: All orders too expensive for max spend Rs.{max_spend:.0f}")
             return
         print(f"  Adjusted total: Rs.{total_cost:,.0f}")
 
@@ -355,7 +382,14 @@ def run_sip():
         results.append(status)
 
     succeeded = sum(1 for s in results if s == "OK")
-    save_carry_forward(0)  # Reset carry after trading day attempt
+    # Carry forward unspent budget
+    actual_spent = sum(
+        o["quantity"] * snapshot.get(o["stock_name"], {}).get("ltp", 0)
+        for i, o in enumerate(orders)
+        if o.get("stock_name") in SIP_ETFS and i < len(results) and results[i] == "OK"
+    )
+    unspent = budget - actual_spent
+    save_carry_forward(max(0, round(unspent, 2)))
     mark_ran_today()
     log.info(f"SIP complete: {succeeded}/{len(results)} orders placed")
     print(f"\nSIP complete: {succeeded}/{len(results)} orders placed")
@@ -366,10 +400,12 @@ def run_sip():
         f"{o['quantity']}x {o['stock_name']} @ Rs.{snapshot.get(o['stock_name'], {}).get('ltp', 0):.2f}"
         for i, o in enumerate(orders) if o.get("stock_name") in SIP_ETFS
     )
+    unspent_msg = f"\nUnspent Rs.{unspent:,.0f} carried to tomorrow" if unspent > 0 else ""
     send_telegram(
         f"*SIP Executed* ({date.today().isoformat()})\n"
-        f"Budget: Rs.{budget:,.0f}\n"
-        f"Orders ({succeeded}/{len(results)}):\n{order_lines}\n\n"
+        f"Budget: Rs.{budget:,.0f} | Spent: Rs.{actual_spent:,.0f}\n"
+        f"Orders ({succeeded}/{len(results)}):\n{order_lines}"
+        f"{unspent_msg}\n\n"
         f"_{reasoning}_"
     )
 
