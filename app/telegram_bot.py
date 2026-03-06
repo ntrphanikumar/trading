@@ -203,6 +203,30 @@ def main():
     from alerts import start_alert_thread
     start_alert_thread(interval_minutes=5)
 
+    # Schedule daily SIP at 3:26 PM IST
+    import threading
+    from datetime import datetime, timedelta
+    import pytz
+
+    def sip_scheduler():
+        ist = pytz.timezone("Asia/Kolkata")
+        while True:
+            now = datetime.now(ist)
+            target = now.replace(hour=15, minute=26, second=0, microsecond=0)
+            if now >= target:
+                target += timedelta(days=1)
+            wait = (target - now).total_seconds()
+            log.info(f"SIP scheduled in {wait/3600:.1f}h at {target.strftime('%Y-%m-%d %H:%M IST')}")
+            time.sleep(wait)
+            try:
+                from sip import run_sip
+                log.info("Running scheduled SIP...")
+                run_sip()
+            except Exception as e:
+                log.error(f"Scheduled SIP error: {e}")
+
+    threading.Thread(target=sip_scheduler, daemon=True).start()
+
     log.info("Telegram bot starting...")
     me = tg_api("getMe")
     if me.get("ok"):

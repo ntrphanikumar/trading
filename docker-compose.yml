@@ -1,0 +1,16 @@
+services:
+  trading-bot:
+    build: .
+    container_name: trading-bot
+    restart: unless-stopped
+    ports:
+      - "5001:5001"
+    volumes:
+      - ./app/.env:/app/.env
+      - ./app/service-config-videograph-ai-5666b2db80fa.json:/app/service-config-videograph-ai-5666b2db80fa.json:ro
+      - ./app/alerts.json:/app/alerts.json
+      - ./app/sip_history.json:/app/sip_history.json
+      - ./app/sip_budget.json:/app/sip_budget.json
+      - ./app/sip.log:/app/sip.log
+    environment:
+      - TZ=Asia/Kolkata

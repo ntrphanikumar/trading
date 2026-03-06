@@ -1,0 +1,8 @@
+app/.env
+app/service-config-*.json
+app/sip.log
+app/sip_history.json
+app/sip_budget.json
+app/alerts.json
+.venv/
+__pycache__/
