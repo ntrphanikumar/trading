@@ -9,6 +9,7 @@ from orders import place_market_order, place_limit_order, get_order_book, get_pe
 from portfolio import get_holdings, get_positions, get_fund_limits
 from stocks import search_stocks
 from market_data import get_quote, get_market_overview
+from alerts import add_alert, remove_alert, list_alerts, send_market_update
 
 HISTORY_FILE = os.path.join(os.path.dirname(__file__), "sip_history.json")
 
@@ -68,6 +69,10 @@ FUNCTIONS = {
     "get_sip_schedule": get_sip_schedule,
     "get_quote": get_quote,
     "get_market_overview": get_market_overview,
+    "add_alert": add_alert,
+    "remove_alert": remove_alert,
+    "list_alerts": list_alerts,
+    "send_market_update": send_market_update,
 }
 
 TOOL_DECLARATIONS = types.Tool(
@@ -149,6 +154,41 @@ TOOL_DECLARATIONS = types.Tool(
             "description": "Get a snapshot of all major Indian market indices — Nifty 50, Bank Nifty, Sensex, Midcap, Smallcap, and India VIX with current values and change. Use when user asks about overall market status or how markets are doing.",
             "parameters": {"type": "object", "properties": {}},
         },
+        {
+            "name": "add_alert",
+            "description": "Set a price alert for a stock or index. You'll be notified via Telegram when the price crosses the threshold. Use when user says things like 'alert me when Nifty crosses 25000' or 'notify me if HDFCBANK drops below 1500'.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "symbol": {"type": "string", "description": "Trading symbol e.g. NIFTY, HDFCBANK, RELIANCE"},
+                    "condition": {"type": "string", "enum": ["above", "below"], "description": "'above' to alert when price rises above target, 'below' when it drops below"},
+                    "price": {"type": "number", "description": "Target price to trigger the alert"},
+                    "exchange": {"type": "string", "enum": ["NSE", "BSE"], "description": "Exchange (default NSE)"},
+                },
+                "required": ["symbol", "condition", "price"],
+            },
+        },
+        {
+            "name": "remove_alert",
+            "description": "Remove a price alert by its index number. Use list_alerts first to see indices.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "index": {"type": "integer", "description": "0-based index of the alert to remove"},
+                },
+                "required": ["index"],
+            },
+        },
+        {
+            "name": "list_alerts",
+            "description": "List all active price alerts. Use when user asks about their alerts or wants to see what alerts are set.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+        {
+            "name": "send_market_update",
+            "description": "Send a market overview + portfolio summary to Telegram right now. Use when user asks for a market update or wants a summary sent to their Telegram.",
+            "parameters": {"type": "object", "properties": {}},
+        },
     ],
 )
 
@@ -166,7 +206,10 @@ Rules:
 - Default to CNC (delivery) product type unless the user specifies intraday.
 - Use get_quote for current stock/index prices and technical analysis.
 - Use get_market_overview for overall market status.
-- Use web_search for market news, analysis, or information not available via other tools."""
+- Use web_search for market news, analysis, or information not available via other tools.
+- Use add_alert to set price alerts (e.g. "alert me when Nifty crosses 25000"). Alerts are checked every 5 minutes and notifications sent via Telegram.
+- Use list_alerts and remove_alert to manage existing alerts.
+- Use send_market_update to send a market + portfolio summary to Telegram on demand."""
 
 
 def make_gemini_config(system_instruction=None):

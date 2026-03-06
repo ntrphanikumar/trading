@@ -112,6 +112,38 @@ def process_gemini_response(response, session):
     return text or "(no response)", False
 
 
+def download_voice(file_id):
+    """Download a voice/audio file from Telegram, return bytes."""
+    resp = requests.get(f"https://api.telegram.org/bot{BOT_TOKEN}/getFile", params={"file_id": file_id}, timeout=10)
+    data = resp.json()
+    if not data.get("ok"):
+        return None
+    file_path = data["result"]["file_path"]
+    audio = requests.get(f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}", timeout=30)
+    return audio.content if audio.status_code == 200 else None
+
+
+def handle_voice(chat_id, file_id):
+    """Handle a voice message — send audio to Gemini for understanding + function calling."""
+    audio_bytes = download_voice(file_id)
+    if not audio_bytes:
+        return "Sorry, couldn't download the voice message."
+
+    session = get_session(chat_id)
+    audio_part = types.Part.from_bytes(data=audio_bytes, mime_type="audio/ogg")
+    session["contents"].append(types.Content(role="user", parts=[audio_part]))
+
+    try:
+        response = llm_client.models.generate_content(
+            model=MODEL, contents=session["contents"], config=gemini_config
+        )
+        reply, _ = process_gemini_response(response, session)
+        return reply
+    except Exception as e:
+        session["contents"].pop()
+        return f"Error processing voice: {e}"
+
+
 def handle_message(chat_id, text):
     """Handle an incoming Telegram message."""
     session = get_session(chat_id)
@@ -158,6 +190,10 @@ def main():
         print("ERROR: telegram_bot_token not set in .env")
         return
 
+    # Start alert checker in background (checks every 5 minutes)
+    from alerts import start_alert_thread
+    start_alert_thread(interval_minutes=5)
+
     log.info("Telegram bot starting...")
     me = tg_api("getMe")
     if me.get("ok"):
@@ -177,7 +213,7 @@ def main():
             for update in updates.get("result", []):
                 offset = update["update_id"] + 1
                 msg = update.get("message")
-                if not msg or not msg.get("text"):
+                if not msg:
                     continue
 
                 chat_id = str(msg["chat"]["id"])
@@ -187,10 +223,22 @@ def main():
                     log.warning(f"Unauthorized access from chat_id: {chat_id}")
                     continue
 
-                text = msg["text"]
-                log.info(f"Message from {chat_id}: {text[:100]}")
-
                 send_typing(chat_id)
+
+                # Voice/audio messages
+                voice = msg.get("voice") or msg.get("audio")
+                if voice:
+                    log.info(f"Voice from {chat_id} ({voice.get('duration', '?')}s)")
+                    reply = handle_voice(chat_id, voice["file_id"])
+                    send_message(chat_id, reply)
+                    continue
+
+                # Text messages
+                text = msg.get("text")
+                if not text:
+                    continue
+
+                log.info(f"Message from {chat_id}: {text[:100]}")
                 reply = handle_message(chat_id, text)
                 send_message(chat_id, reply)
 
