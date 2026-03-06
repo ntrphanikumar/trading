@@ -22,7 +22,7 @@ gemini_config = make_gemini_config(
 Rules:
 - Keep responses concise (Telegram messages have limits).
 - Use search_stocks to find symbols when user mentions company names.
-- For trade actions, clearly state what you'll do. The user must reply YES to confirm.
+- For trade actions (buy, sell, cancel), call the function directly. The system will automatically ask the user for confirmation before executing — do NOT ask for confirmation yourself.
 - For read-only operations, execute immediately.
 - Format financial data with Rs. symbol.
 - Use get_quote for current stock/index prices and technical analysis.
@@ -148,9 +148,18 @@ def handle_message(chat_id, text):
     """Handle an incoming Telegram message."""
     session = get_session(chat_id)
 
-    if text.strip().lower() in ("/clear", "/reset"):
+    cmd = text.strip().lower()
+    if cmd in ("/clear", "/reset"):
         sessions.pop(chat_id, None)
         return "Chat cleared. How can I help?"
+
+    if cmd == "/sip":
+        from sip import run_sip
+        import io, contextlib
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            run_sip()
+        return buf.getvalue() or "SIP completed."
 
     if session["pending"]:
         pc = session["pending"]

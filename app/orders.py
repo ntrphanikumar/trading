@@ -15,6 +15,7 @@ def place_market_order(stock_name, quantity, transaction_type, product_type="CNC
     return dhan.place_order(
         security_id=security_id,
         quantity=int(quantity),
+        price=0,
         exchange_segment=dhan.NSE,
         transaction_type=TRANSACTION_TYPES.get(transaction_type.upper(), dhan.BUY),
         order_type=dhan.MARKET,

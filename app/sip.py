@@ -60,6 +60,27 @@ def save_carry_forward(amount):
         json.dump({"carry_forward": round(amount, 2)}, f)
 
 
+def already_ran_today():
+    """Check if SIP already ran today (success, market closed, or any outcome)."""
+    if os.path.exists(BUDGET_FILE):
+        with open(BUDGET_FILE) as f:
+            data = json.load(f)
+        if data.get("last_run") == date.today().isoformat():
+            return True
+    return False
+
+
+def mark_ran_today():
+    """Mark that SIP has run today (in budget file)."""
+    data = {}
+    if os.path.exists(BUDGET_FILE):
+        with open(BUDGET_FILE) as f:
+            data = json.load(f)
+    data["last_run"] = date.today().isoformat()
+    with open(BUDGET_FILE, "w") as f:
+        json.dump(data, f)
+
+
 def save_trade_history(date_str, budget, reasoning, orders, results):
     """Append today's SIP run to trade history."""
     history = []
@@ -78,7 +99,7 @@ def save_trade_history(date_str, budget, reasoning, orders, results):
     with open(HISTORY_FILE, "w") as f:
         json.dump(history, f, indent=2)
 
-SIP_MODEL = "gemini-3.1-flash-preview"
+SIP_MODEL = "gemini-2.5-flash"
 
 
 def get_portfolio_snapshot():
@@ -156,42 +177,60 @@ You MUST respond with ONLY a valid JSON object in this exact format, nothing els
 Rules:
 - Only include ETFs where quantity > 0
 - Quantities must be whole numbers (you're buying actual units, not fractional)
-- Total cost (quantity * ltp) should be close to Rs.{budget} — you have 10% flexibility (up to Rs.{int(budget * 1.1)}) to fit whole units
-- Maximize budget utilization — don't leave too much unspent
+- HARD BUDGET LIMIT: Total cost (sum of quantity * ltp for all orders) MUST NOT exceed Rs.{budget}. Calculate carefully before responding.
+- Maximize budget utilization — get as close to Rs.{budget} as possible without exceeding it
 - You can skip ETFs that are overweight or where market conditions don't favor buying
 - Use the LTP values from the portfolio data for cost calculations"""
 
     response = llm_client.models.generate_content(
-        model=MODEL,
+        model=SIP_MODEL,
         contents=prompt,
         config=types.GenerateContentConfig(
             tools=[types.Tool(google_search=types.GoogleSearch())],
-            thinking_config=types.ThinkingConfig(
-                thinking_level=types.ThinkingLevel.MEDIUM,
-                include_thoughts=True,
-            ),
-            temperature=0.3,
+            thinking_config=types.ThinkingConfig(thinking_budget=2048, include_thoughts=True),
         ),
     )
 
     text = extract_text(response)
 
-    # Parse JSON from response (handle markdown code blocks)
+    # Parse JSON from response (handle markdown code blocks, extra text)
     text = text.strip()
-    if text.startswith("```"):
-        text = text.split("\n", 1)[1]  # remove ```json line
-        text = text.rsplit("```", 1)[0]  # remove trailing ```
+    if "```" in text:
+        # Extract content between code fences
+        parts = text.split("```")
+        for part in parts[1::2]:  # odd-indexed parts are inside fences
+            part = part.strip()
+            if part.startswith("json"):
+                part = part[4:].strip()
+            if part.startswith("{"):
+                text = part
+                break
+    # If still not JSON, try to find the JSON object in the text
+    if not text.startswith("{"):
+        start = text.find("{")
+        end = text.rfind("}") + 1
+        if start >= 0 and end > start:
+            text = text[start:end]
 
+    log.info(f"LLM raw response: {text[:500]}")
     return json.loads(text)
 
 
 def run_sip():
+    """Run daily SIP. Returns a status message string."""
     log.info("=" * 40)
+
+    if already_ran_today():
+        msg = f"SIP already executed today ({date.today().isoformat()}). Skipping."
+        log.info(msg)
+        print(msg)
+        return msg
 
     # Check if market is open
     if not is_market_open():
         carry = load_carry_forward() + DAILY_BUDGET
         save_carry_forward(carry)
+        mark_ran_today()
         log.info(f"Market closed/holiday — carried forward Rs.{DAILY_BUDGET}, total carry Rs.{carry}")
         print(f"Market is closed today. Rs.{DAILY_BUDGET} carried forward (total: Rs.{carry})")
         send_telegram(f"Market closed today. Rs.{DAILY_BUDGET} carried forward (total: Rs.{carry})")
@@ -206,6 +245,7 @@ def run_sip():
     if funds.get("status") != "success":
         log.error(f"Failed to fetch fund limits: {funds}")
         print(f"ERROR: Could not fetch fund limits: {funds}")
+        send_telegram(f"SIP FAILED: Could not fetch fund limits")
         return
 
     available = float(funds.get("data", {}).get("availabelBalance", 0))
@@ -214,12 +254,14 @@ def run_sip():
     if available < budget:
         log.warning(f"Insufficient balance Rs.{available} < Rs.{budget}")
         print(f"Insufficient balance Rs.{available:.0f} (need Rs.{budget}), skipping SIP")
+        send_telegram(f"SIP SKIPPED: Insufficient balance Rs.{available:.0f} (need Rs.{budget:.0f})")
         return
 
     # Get portfolio snapshot
     snapshot = get_portfolio_snapshot()
     if snapshot is None:
         print("ERROR: Could not fetch holdings")
+        send_telegram("SIP FAILED: Could not fetch holdings")
         return
 
     total_value = sum(v["value"] for v in snapshot.values())
@@ -238,6 +280,7 @@ def run_sip():
     except Exception as e:
         log.error(f"LLM error: {e}")
         print(f"ERROR: LLM failed — {e}")
+        send_telegram(f"SIP FAILED: LLM error — {e}")
         return
 
     reasoning = decision.get("reasoning", "")
@@ -248,6 +291,7 @@ def run_sip():
 
     if not orders:
         print("No orders recommended today.")
+        send_telegram(f"SIP: No orders recommended today.\n\n_{reasoning}_")
         save_carry_forward(0)
         return
 
@@ -263,10 +307,29 @@ def run_sip():
         print(f"  BUY {qty:>4} x {sym:12s} @ Rs.{ltp:>8.2f} = Rs.{cost:>8.0f}  ({o.get('rationale', '')})")
     print(f"  Total: Rs.{total_cost:,.0f}")
 
-    if total_cost > budget * 1.1:  # 10% tolerance for whole unit rounding
-        print(f"\nWARNING: Total Rs.{total_cost:.0f} exceeds budget Rs.{budget:.0f}, skipping")
-        log.warning(f"LLM exceeded budget: Rs.{total_cost:.0f} > Rs.{budget:.0f}")
-        return
+    if total_cost > budget:
+        log.warning(f"LLM exceeded budget: Rs.{total_cost:.0f} > Rs.{budget:.0f}, trimming orders")
+        print(f"\n  Over budget — trimming to fit Rs.{budget:.0f}...")
+        # Remove orders from the end until we fit
+        while total_cost > budget and orders:
+            dropped = orders.pop()
+            drop_ltp = snapshot.get(dropped["stock_name"], {}).get("ltp", 0)
+            total_cost -= dropped["quantity"] * drop_ltp
+            print(f"  Dropped {dropped['stock_name']} x{dropped['quantity']}")
+        # If still over, reduce quantity of the last remaining order
+        if orders and total_cost > budget:
+            last = orders[-1]
+            last_ltp = snapshot.get(last["stock_name"], {}).get("ltp", 1)
+            excess = total_cost - budget
+            reduce_qty = int(excess / last_ltp) + 1
+            last["quantity"] = max(0, last["quantity"] - reduce_qty)
+            total_cost = sum(o["quantity"] * snapshot.get(o["stock_name"], {}).get("ltp", 0) for o in orders)
+        orders = [o for o in orders if o.get("quantity", 0) > 0]
+        if not orders:
+            print("  No orders remain after trimming.")
+            send_telegram(f"SIP FAILED: All orders exceeded budget Rs.{budget:.0f} after trimming")
+            return
+        print(f"  Adjusted total: Rs.{total_cost:,.0f}")
 
     # Place orders
     print()
@@ -293,6 +356,7 @@ def run_sip():
 
     succeeded = sum(1 for s in results if s == "OK")
     save_carry_forward(0)  # Reset carry after trading day attempt
+    mark_ran_today()
     log.info(f"SIP complete: {succeeded}/{len(results)} orders placed")
     print(f"\nSIP complete: {succeeded}/{len(results)} orders placed")
 
