@@ -46,12 +46,21 @@ def is_market_open():
     return True  # Default: assume open
 
 
+def _load_budget_data():
+    """Load budget JSON file, returning {} on missing/empty/invalid."""
+    if os.path.exists(BUDGET_FILE):
+        try:
+            with open(BUDGET_FILE) as f:
+                content = f.read().strip()
+                return json.loads(content) if content else {}
+        except (json.JSONDecodeError, ValueError):
+            return {}
+    return {}
+
+
 def load_carry_forward():
     """Load carry-forward amount from previous holiday accumulations."""
-    if os.path.exists(BUDGET_FILE):
-        with open(BUDGET_FILE) as f:
-            return json.load(f).get("carry_forward", 0)
-    return 0
+    return _load_budget_data().get("carry_forward", 0)
 
 
 def save_carry_forward(amount):
@@ -62,31 +71,32 @@ def save_carry_forward(amount):
 
 def already_ran_today():
     """Check if SIP already ran today (success, market closed, or any outcome)."""
-    if os.path.exists(BUDGET_FILE):
-        with open(BUDGET_FILE) as f:
-            data = json.load(f)
-        if data.get("last_run") == date.today().isoformat():
-            return True
-    return False
+    return _load_budget_data().get("last_run") == date.today().isoformat()
 
 
 def mark_ran_today():
     """Mark that SIP has run today (in budget file)."""
-    data = {}
-    if os.path.exists(BUDGET_FILE):
-        with open(BUDGET_FILE) as f:
-            data = json.load(f)
+    data = _load_budget_data()
     data["last_run"] = date.today().isoformat()
     with open(BUDGET_FILE, "w") as f:
         json.dump(data, f)
 
 
+def _load_history():
+    """Load trade history, returning [] on missing/empty/invalid."""
+    if os.path.exists(HISTORY_FILE):
+        try:
+            with open(HISTORY_FILE) as f:
+                content = f.read().strip()
+                return json.loads(content) if content else []
+        except (json.JSONDecodeError, ValueError):
+            return []
+    return []
+
+
 def save_trade_history(date_str, budget, reasoning, orders, results):
     """Append today's SIP run to trade history."""
-    history = []
-    if os.path.exists(HISTORY_FILE):
-        with open(HISTORY_FILE) as f:
-            history = json.load(f)
+    history = _load_history()
 
     history.append({
         "date": date_str,
@@ -105,10 +115,9 @@ WEEKLY_OVERSPEND_LIMIT = WEEKLY_BUDGET * 0.20  # 20% weekly flex
 
 def get_week_spent():
     """Total amount spent this week (Mon-Fri) from trade history."""
-    if not os.path.exists(HISTORY_FILE):
+    history = _load_history()
+    if not history:
         return 0
-    with open(HISTORY_FILE) as f:
-        history = json.load(f)
     today = date.today()
     monday = today - __import__('datetime').timedelta(days=today.weekday())
     total = 0

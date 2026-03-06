@@ -171,3 +171,6 @@ cython_debug/
 .pypirc
 service-config*
 .DS_Store
+app/alerts.json
+app/sip_budget.json
+app/sip_history.json
