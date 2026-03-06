@@ -2,14 +2,11 @@ import os
 import json
 import logging
 from datetime import date
-from google import genai
 from google.genai import types
-from dotenv import load_dotenv
 from orders import place_market_order
 from portfolio import get_holdings, get_fund_limits
 from notify import send_telegram
-
-load_dotenv(os.path.join(os.path.dirname(__file__), '.env'))
+from gemini import llm_client, extract_text
 
 # Configure logging
 logging.basicConfig(
@@ -36,16 +33,13 @@ def is_market_open():
     """Ask LLM with Google Search grounding if NSE is open today."""
     try:
         resp = llm_client.models.generate_content(
-            model=MODEL,
+            model=SIP_MODEL,
             contents="Is the Indian stock market (NSE) open for trading today? Reply with only YES or NO.",
             config=types.GenerateContentConfig(
                 tools=[types.Tool(google_search=types.GoogleSearch())],
             ),
         )
-        text = ""
-        for part in resp.candidates[0].content.parts:
-            if not getattr(part, "thought", False) and part.text:
-                text += part.text
+        text = extract_text(resp)
         return "YES" in text.upper().strip()
     except Exception as e:
         log.warning(f"Could not check market status: {e}")
@@ -84,16 +78,7 @@ def save_trade_history(date_str, budget, reasoning, orders, results):
     with open(HISTORY_FILE, "w") as f:
         json.dump(history, f, indent=2)
 
-# Vertex AI setup
-os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = os.path.join(
-    os.path.dirname(__file__), os.getenv("google_service_account")
-)
-llm_client = genai.Client(
-    vertexai=True,
-    project=os.getenv("google_project_id"),
-    location=os.getenv("google_location", "global"),
-)
-MODEL = "gemini-3.1-flash-preview"
+SIP_MODEL = "gemini-3.1-flash-preview"
 
 
 def get_portfolio_snapshot():
@@ -189,11 +174,7 @@ Rules:
         ),
     )
 
-    # Extract text from response (skip thought parts)
-    text = ""
-    for part in response.candidates[0].content.parts:
-        if not part.thought and part.text:
-            text += part.text
+    text = extract_text(response)
 
     # Parse JSON from response (handle markdown code blocks)
     text = text.strip()

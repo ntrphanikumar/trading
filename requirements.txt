@@ -3,3 +3,6 @@ requests
 python-dotenv
 google-genai
 flask
+pyotp
+PyJWT
+tradingview-ta

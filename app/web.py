@@ -1,170 +1,11 @@
 import os
 import json
 from flask import Flask, request, jsonify, render_template_string
-from google import genai
 from google.genai import types
-from dotenv import load_dotenv
+from gemini import llm_client, MODEL, extract_text
+from tools import CONFIRM_REQUIRED, HISTORY_FILE, execute_function, make_gemini_config
 
-load_dotenv(os.path.join(os.path.dirname(__file__), '.env'))
-
-os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = os.path.join(
-    os.path.dirname(__file__), os.getenv("google_service_account")
-)
-
-client = genai.Client(
-    vertexai=True,
-    project=os.getenv("google_project_id"),
-    location=os.getenv("google_location", "global"),
-)
-
-MODEL = "gemini-2.5-flash"
-
-# Import trading functions
-from orders import place_market_order, place_limit_order, get_order_book, get_pending_orders, cancel_order
-from portfolio import get_holdings, get_positions, get_fund_limits
-from stocks import search_stocks
-
-HISTORY_FILE = os.path.join(os.path.dirname(__file__), "sip_history.json")
-
-CONFIRM_REQUIRED = {"place_market_order", "place_limit_order", "cancel_order"}
-
-
-def get_sip_schedule():
-    """Get SIP cron schedule and next execution info."""
-    import subprocess
-    try:
-        result = subprocess.run(["crontab", "-l"], capture_output=True, text=True)
-        if result.returncode != 0:
-            return {"message": "No crontab configured"}
-        sip_lines = [l.strip() for l in result.stdout.splitlines() if "sip.py" in l and not l.startswith("#")]
-        if not sip_lines:
-            return {"message": "No SIP cron job found"}
-        return {"cron_entries": sip_lines, "raw_crontab": result.stdout}
-    except Exception as e:
-        return {"error": str(e)}
-
-
-def get_sip_history(last_n=None):
-    """Get SIP trade history."""
-    if not os.path.exists(HISTORY_FILE):
-        return {"trades": [], "message": "No SIP history yet"}
-    with open(HISTORY_FILE) as f:
-        history = json.load(f)
-    if last_n:
-        history = history[-int(last_n):]
-    return {"trades": history, "total": len(history)}
-
-
-def web_search(query):
-    resp = client.models.generate_content(
-        model=MODEL,
-        contents=query,
-        config=types.GenerateContentConfig(
-            tools=[types.Tool(google_search=types.GoogleSearch())],
-            system_instruction="You are a financial research assistant. Provide concise, factual answers about markets, stocks, and financial news.",
-        ),
-    )
-    text = ""
-    for part in resp.candidates[0].content.parts:
-        if not getattr(part, "thought", False) and part.text:
-            text += part.text
-    return {"result": text}
-
-
-FUNCTIONS = {
-    "place_market_order": place_market_order,
-    "place_limit_order": place_limit_order,
-    "get_order_book": get_order_book,
-    "get_pending_orders": get_pending_orders,
-    "cancel_order": cancel_order,
-    "get_holdings": get_holdings,
-    "get_positions": get_positions,
-    "get_fund_limits": get_fund_limits,
-    "search_stocks": search_stocks,
-    "web_search": web_search,
-    "get_sip_history": get_sip_history,
-    "get_sip_schedule": get_sip_schedule,
-}
-
-tool_declarations = types.Tool(
-    function_declarations=[
-        {
-            "name": "place_market_order",
-            "description": "Place a market order (buy or sell) for a stock by name.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "stock_name": {"type": "string", "description": "Trading symbol e.g. NIFTYBEES, HDFCBANK"},
-                    "quantity": {"type": "integer", "description": "Number of shares"},
-                    "transaction_type": {"type": "string", "enum": ["BUY", "SELL"]},
-                    "product_type": {"type": "string", "enum": ["CNC", "INTRADAY"], "description": "Default CNC."},
-                },
-                "required": ["stock_name", "quantity", "transaction_type"],
-            },
-        },
-        {
-            "name": "place_limit_order",
-            "description": "Place a limit order at a specific price.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "stock_name": {"type": "string"},
-                    "quantity": {"type": "integer"},
-                    "price": {"type": "number"},
-                    "transaction_type": {"type": "string", "enum": ["BUY", "SELL"]},
-                    "product_type": {"type": "string", "enum": ["CNC", "INTRADAY"]},
-                },
-                "required": ["stock_name", "quantity", "price", "transaction_type"],
-            },
-        },
-        {"name": "get_order_book", "description": "Get all orders placed today.", "parameters": {"type": "object", "properties": {}}},
-        {"name": "get_pending_orders", "description": "Get pending/open orders.", "parameters": {"type": "object", "properties": {}}},
-        {
-            "name": "cancel_order",
-            "description": "Cancel a pending order by order ID.",
-            "parameters": {"type": "object", "properties": {"order_id": {"type": "string"}}, "required": ["order_id"]},
-        },
-        {"name": "get_holdings", "description": "Get all demat holdings.", "parameters": {"type": "object", "properties": {}}},
-        {"name": "get_positions", "description": "Get open intraday positions.", "parameters": {"type": "object", "properties": {}}},
-        {"name": "get_fund_limits", "description": "Get fund balance and margin.", "parameters": {"type": "object", "properties": {}}},
-        {
-            "name": "search_stocks",
-            "description": "Search stocks by name or symbol.",
-            "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]},
-        },
-        {
-            "name": "web_search",
-            "description": "Search the web for real-time market data, stock news, or financial information.",
-            "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]},
-        },
-        {
-            "name": "get_sip_history",
-            "description": "Get the history of automated SIP trades — dates, ETFs bought, quantities, budget, reasoning, and success/failure. Use when user asks about past SIP trades, investment history, or how much was invested.",
-            "parameters": {"type": "object", "properties": {"last_n": {"type": "integer", "description": "Return only the last N trades. Omit to get all."}}}
-        },
-        {
-            "name": "get_sip_schedule",
-            "description": "Get the SIP cron schedule — shows when the next automated SIP will run. Use when user asks about SIP schedule, next run, or cron configuration.",
-            "parameters": {"type": "object", "properties": {}},
-        },
-    ],
-)
-
-from datetime import date as _date
-
-gemini_config = types.GenerateContentConfig(
-    tools=[tool_declarations],
-    thinking_config=types.ThinkingConfig(thinking_budget=2048, include_thoughts=True),
-    system_instruction=f"""You are a trading assistant for the Indian stock market (NSE) via DhanHQ broker.
-Today's date is {_date.today().isoformat()}.
-Rules:
-- Use search_stocks to find symbols when user mentions company names.
-- For trade actions, clearly state what you'll do and ask for confirmation.
-- For read-only operations, execute immediately.
-- Format financial data with ₹ symbol.
-- Use web_search for market news, analysis, or real-time data.
-- Default to CNC product type unless user says intraday.""",
-)
+gemini_config = make_gemini_config()
 
 # Per-session chat histories (simple in-memory store)
 sessions = {}
@@ -197,7 +38,7 @@ def chat():
     data = request.json
     msg = data.get("message", "").strip()
     session_id = data.get("session_id", "default")
-    confirmed = data.get("confirmed")  # True/False for confirmation responses
+    confirmed = data.get("confirmed")
 
     if not msg and confirmed is None:
         return jsonify({"error": "No message"}), 400
@@ -220,30 +61,23 @@ def chat():
         session["pending_confirmation"] = None
 
         if confirmed:
-            func = FUNCTIONS.get(pc["func_name"])
-            try:
-                result = func(**pc["args"])
-                if not isinstance(result, dict):
-                    result = {"data": result}
-            except Exception as e:
-                result = {"status": "error", "message": str(e)}
+            result = execute_function(pc["func_name"], pc["args"])
         else:
             result = {"status": "cancelled", "message": "User declined"}
 
-        # Resume the Gemini conversation with the function response
         contents.append(pc["gemini_content"])
         contents.append(types.Content(role="user", parts=[
             types.Part.from_function_response(name=pc["func_name"], response=result)
         ]))
 
-        response = client.models.generate_content(model=MODEL, contents=contents, config=gemini_config)
+        response = llm_client.models.generate_content(model=MODEL, contents=contents, config=gemini_config)
         return _process_response(response, contents, session)
 
     # Normal message
     contents.append(types.Content(role="user", parts=[types.Part(text=msg)]))
 
     try:
-        response = client.models.generate_content(model=MODEL, contents=contents, config=gemini_config)
+        response = llm_client.models.generate_content(model=MODEL, contents=contents, config=gemini_config)
         return _process_response(response, contents, session)
     except Exception as e:
         contents.pop()
@@ -252,8 +86,7 @@ def chat():
 
 def _process_response(response, contents, session):
     """Process Gemini response, handling function calls and confirmations."""
-    max_rounds = 10
-    for _ in range(max_rounds):
+    for _ in range(10):
         if not response.candidates or not response.candidates[0].content.parts:
             break
 
@@ -269,14 +102,12 @@ def _process_response(response, contents, session):
             func_name = fc.name
             args = dict(fc.args)
 
-            # If confirmation required, pause and ask user
             if func_name in CONFIRM_REQUIRED:
                 session["pending_confirmation"] = {
                     "func_name": func_name,
                     "args": args,
                     "gemini_content": response.candidates[0].content,
                 }
-                # Remove the appended content since we'll re-add after confirmation
                 contents.pop()
                 return jsonify({
                     "needs_confirmation": True,
@@ -284,32 +115,20 @@ def _process_response(response, contents, session):
                     "args": args,
                 })
 
-            func = FUNCTIONS.get(func_name)
-            if func:
-                try:
-                    result = func(**args)
-                    if not isinstance(result, dict):
-                        result = {"data": result}
-                except Exception as e:
-                    result = {"status": "error", "message": str(e)}
-            else:
-                result = {"status": "error", "message": f"Unknown function: {func_name}"}
-
+            result = execute_function(func_name, args)
             function_response_parts.append(
                 types.Part.from_function_response(name=func_name, response=result)
             )
 
         if function_response_parts:
             contents.append(types.Content(role="user", parts=function_response_parts))
-            response = client.models.generate_content(model=MODEL, contents=contents, config=gemini_config)
+            response = llm_client.models.generate_content(model=MODEL, contents=contents, config=gemini_config)
 
     # Extract final text
     text = ""
     if response.candidates and response.candidates[0].content.parts:
         contents.append(response.candidates[0].content)
-        for part in response.candidates[0].content.parts:
-            if not getattr(part, "thought", False) and part.text:
-                text += part.text
+        text = extract_text(response)
 
     return jsonify({"response": text})
 
