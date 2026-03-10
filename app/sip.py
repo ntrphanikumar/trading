@@ -64,9 +64,11 @@ def load_carry_forward():
 
 
 def save_carry_forward(amount):
-    """Save carry-forward budget."""
+    """Save carry-forward budget (preserves other fields like last_run)."""
+    data = _load_budget_data()
+    data["carry_forward"] = round(amount, 2)
     with open(BUDGET_FILE, "w") as f:
-        json.dump({"carry_forward": round(amount, 2)}, f)
+        json.dump(data, f)
 
 
 def already_ran_today():
@@ -258,6 +260,9 @@ def run_sip():
         log.info(msg)
         print(msg)
         return msg
+
+    # Mark immediately to prevent duplicate runs (race condition guard)
+    mark_ran_today()
 
     # Check if market is open
     if not is_market_open():
